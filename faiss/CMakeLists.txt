@@ -351,6 +351,12 @@ if(NOT WIN32)
   list(APPEND FAISS_HEADERS invlists/OnDiskInvertedLists.h)
 endif()
 
+# ---- SPDK-backed inverted lists (Linux only) --------------------------------
+if(FAISS_ENABLE_SPDK AND NOT WIN32)
+  list(APPEND FAISS_SRC invlists/SpdkInvertedLists.cpp)
+  list(APPEND FAISS_HEADERS invlists/SpdkInvertedLists.h)
+endif()
+
 # Export FAISS_HEADERS variable to parent scope.
 set(FAISS_HEADERS ${FAISS_HEADERS} PARENT_SCOPE)
 
@@ -587,6 +593,52 @@ else()
   target_link_libraries(faiss_avx512 PRIVATE ${LAPACK_LIBRARIES})
   target_link_libraries(faiss_avx512_spr PRIVATE ${LAPACK_LIBRARIES})
   target_link_libraries(faiss_sve PRIVATE ${LAPACK_LIBRARIES})
+endif()
+
+# ---- SPDK include dirs and libraries ----------------------------------------
+if(FAISS_ENABLE_SPDK AND NOT WIN32)
+  # Locate SPDK headers.
+  if(FAISS_SPDK_PREFIX)
+    set(SPDK_INCLUDE_DIR "${FAISS_SPDK_PREFIX}/include")
+    set(SPDK_LIB_DIR     "${FAISS_SPDK_PREFIX}/lib")
+  else()
+    # Fall back to the sibling spdk/ tree in this repo.
+    get_filename_component(_repo_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+    set(SPDK_INCLUDE_DIR "${_repo_root}/spdk/include")
+    set(SPDK_LIB_DIR     "${_repo_root}/spdk/build/lib")
+  endif()
+
+  # SPDK requires a set of its own libraries plus DPDK.
+  # Adjust the list if your SPDK build enables/disables additional modules.
+  set(SPDK_LIBS
+    spdk_nvme
+    spdk_env_dpdk
+    spdk_util
+    spdk_log
+    rte_eal
+    rte_mempool
+    rte_mempool_ring
+    rte_bus_pci
+    rte_pci
+    rte_ring
+    rte_kvargs
+    rte_telemetry
+    uuid
+    pthread
+    dl
+    numa
+  )
+
+  foreach(_tgt faiss faiss_avx2 faiss_avx512 faiss_avx512_spr faiss_sve)
+    if(TARGET ${_tgt})
+      target_compile_definitions(${_tgt} PUBLIC FAISS_HAVE_SPDK)
+      target_include_directories(${_tgt} PRIVATE ${SPDK_INCLUDE_DIR})
+      target_link_directories(${_tgt} PRIVATE ${SPDK_LIB_DIR})
+      foreach(_lib ${SPDK_LIBS})
+        target_link_libraries(${_tgt} PRIVATE ${_lib})
+      endforeach()
+    endif()
+  endforeach()
 endif()
 
 install(TARGETS faiss

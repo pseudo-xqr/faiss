@@ -73,6 +73,9 @@ option(FAISS_ENABLE_C_API "Build C API." OFF)
 option(FAISS_ENABLE_EXTRAS "Build extras like benchmarks and demos" ON)
 option(FAISS_USE_LTO "Enable Link-Time optimization" OFF)
 option(FAISS_ENABLE_SVS "Enable SVS (Intel(R) Scalable Vector Search) integration." OFF)
+option(FAISS_ENABLE_SPDK "Enable SPDK-backed NVMe inverted lists (SpdkInvertedLists)." OFF)
+set(FAISS_SPDK_PREFIX "" CACHE PATH
+    "Root directory of the SPDK installation (must contain include/ and lib/).")
 set(FAISS_SVS_RUNTIME_VERSION "v0" CACHE STRING "Version of the SVS runtime API to use")
 set_property(CACHE FAISS_SVS_RUNTIME_VERSION PROPERTY STRINGS "v0")
 
