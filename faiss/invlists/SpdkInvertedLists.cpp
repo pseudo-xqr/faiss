@@ -49,9 +49,11 @@ void ensure_spdk_env() {
         return;
     }
     struct spdk_env_opts opts;
+    opts.opts_size = sizeof(opts);
     spdk_env_opts_init(&opts);
     opts.name = "faiss_spdk";
-    opts.shm_id = -1; // private DPDK memory; no shared-memory segment
+    opts.shm_id = -1;        // private DPDK memory; no shared-memory segment
+    opts.iova_mode = "va";   // virtual-address IOVA; works without hugepage PA access
     int rc = spdk_env_init(&opts);
     FAISS_THROW_IF_NOT_FMT(rc == 0, "spdk_env_init failed (rc=%d)", rc);
     g_spdk_env_initialized = true;
