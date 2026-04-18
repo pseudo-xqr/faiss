@@ -5,7 +5,9 @@
 #include <cstdint>
 #include <list>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <faiss/invlists/InvertedLists.h>
@@ -96,8 +98,17 @@ struct SpdkInvertedLists : InvertedLists {
     void load_metadata();
 
 private:
-    /// Serialises all qpair accesses (SPDK qpairs are single-threaded).
-    mutable std::mutex io_mutex;
+    /// Shared mutex: read ops take shared_lock (parallel), writes take unique_lock.
+    mutable std::shared_mutex rw_mutex;
+
+    /// Guards the thread_qpairs tracking list.
+    mutable std::mutex qpairs_mutex;
+
+    /// All qpairs allocated for worker threads; freed in cleanup_spdk().
+    mutable std::vector<struct spdk_nvme_qpair*> thread_qpairs;
+
+    /// Returns (creating if needed) the SPDK qpair for the calling thread.
+    struct spdk_nvme_qpair* get_thread_qpair() const;
 
     /// Detect whether trid_or_pcie is a full NVMf trid ("trtype:…") or a
     /// bare PCIe BDF / nullptr and dispatch to the appropriate init path.
@@ -128,10 +139,10 @@ private:
     /// Return a byte range to the free list.
     void free_slot(uint64_t offset, uint64_t capacity_bytes);
 
-    /// Resize a list while io_mutex is already held by the caller.
+    /// Resize a list while rw_mutex is already held exclusively by the caller.
     void resize_locked(size_t list_no, size_t new_size);
 
-    /// Write entries to device while io_mutex is already held by the caller.
+    /// Write entries to device while rw_mutex is already held exclusively by the caller.
     void update_entries_locked(
             size_t list_no,
             size_t entry_offset,

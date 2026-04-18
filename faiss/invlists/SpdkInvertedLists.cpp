@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cerrno>
 #include <cstring>
+#include <unordered_map>
 
 #include <spdk/env.h>
 #include <spdk/nvme.h>
@@ -226,10 +227,38 @@ void SpdkInvertedLists::cleanup_spdk() {
         spdk_nvme_ctrlr_free_io_qpair(qpair);
         qpair = nullptr;
     }
+    {
+        std::lock_guard<std::mutex> lk(qpairs_mutex);
+        for (auto* qp : thread_qpairs) {
+            spdk_nvme_ctrlr_free_io_qpair(qp);
+        }
+        thread_qpairs.clear();
+    }
     if (ctrlr) {
         spdk_nvme_detach(ctrlr);
         ctrlr = nullptr;
     }
+}
+
+// One qpair per (thread × controller); created lazily on first use.
+static thread_local std::unordered_map<
+        struct spdk_nvme_ctrlr*,
+        struct spdk_nvme_qpair*>
+        tl_qpairs;
+
+struct spdk_nvme_qpair* SpdkInvertedLists::get_thread_qpair() const {
+    auto it = tl_qpairs.find(ctrlr);
+    if (it == tl_qpairs.end() || it->second == nullptr) {
+        auto* qp = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, nullptr, 0);
+        FAISS_THROW_IF_NOT_MSG(
+                qp != nullptr,
+                "SpdkInvertedLists: failed to alloc per-thread I/O qpair");
+        tl_qpairs[ctrlr] = qp;
+        std::lock_guard<std::mutex> lk(qpairs_mutex);
+        thread_qpairs.push_back(qp);
+        return qp;
+    }
+    return it->second;
 }
 
 // ============================================================
@@ -333,8 +362,9 @@ void SpdkInvertedLists::nvme_read(
         return;
     }
 
-    // Cap each NVMe command to the namespace max transfer size so we never
-    // exceed the NVMf TCP transport's per-PDU limit (typically 128 KB).
+    // Each calling thread uses its own qpair — no serialisation needed.
+    struct spdk_nvme_qpair* tqpair = get_thread_qpair();
+
     uint32_t max_io = spdk_nvme_ns_get_max_io_xfer_size(ns);
     if (max_io == 0 || max_io > 131072u) {
         max_io = 131072u;
@@ -366,14 +396,14 @@ void SpdkInvertedLists::nvme_read(
 
         IoCompletion comp;
         int rc = spdk_nvme_ns_cmd_read(
-                ns, qpair, dma_buf, lba, lba_count, io_complete_cb, &comp, 0);
+                ns, tqpair, dma_buf, lba, lba_count, io_complete_cb, &comp, 0);
         FAISS_THROW_IF_NOT_FMT(
                 rc == 0,
                 "SpdkInvertedLists: spdk_nvme_ns_cmd_read submission failed "
                 "(rc=%d)",
                 rc);
         while (!comp.done) {
-            spdk_nvme_qpair_process_completions(qpair, 0);
+            spdk_nvme_qpair_process_completions(tqpair, 0);
         }
         FAISS_THROW_IF_NOT_MSG(
                 !comp.error, "SpdkInvertedLists: NVMe read command failed");
@@ -454,7 +484,6 @@ void SpdkInvertedLists::nvme_write(
         const void* buf) {
 
     if (size == 0) return;
-    printf("[nvme_write]\n");
 
     const char* src = static_cast<const char*>(buf);
     uint64_t cur_byte_offset = byte_offset;
@@ -634,7 +663,7 @@ size_t SpdkInvertedLists::list_size(size_t list_no) const {
 }
 
 const uint8_t* SpdkInvertedLists::get_codes(size_t list_no) const {
-    std::lock_guard<std::mutex> lock(io_mutex);
+    std::shared_lock<std::shared_mutex> lock(rw_mutex);
     const List& l = lists[list_no];
     if (l.size == 0 || l.offset == UINT64_MAX) {
         return nullptr;
@@ -646,7 +675,7 @@ const uint8_t* SpdkInvertedLists::get_codes(size_t list_no) const {
 }
 
 const idx_t* SpdkInvertedLists::get_ids(size_t list_no) const {
-    std::lock_guard<std::mutex> lock(io_mutex);
+    std::shared_lock<std::shared_mutex> lock(rw_mutex);
     const List& l = lists[list_no];
     if (l.size == 0 || l.offset == UINT64_MAX) {
         return nullptr;
@@ -753,7 +782,7 @@ void SpdkInvertedLists::resize_locked(size_t list_no, size_t new_size) {
 
 void SpdkInvertedLists::resize(size_t list_no, size_t new_size) {
     FAISS_THROW_IF_NOT(!read_only);
-    std::lock_guard<std::mutex> lock(io_mutex);
+    std::unique_lock<std::shared_mutex> lock(rw_mutex);
     resize_locked(list_no, new_size);
 }
 
@@ -766,7 +795,7 @@ size_t SpdkInvertedLists::add_entries(
     if (n_entry == 0) {
         return 0;
     }
-    std::lock_guard<std::mutex> lock(io_mutex);
+    std::unique_lock<std::shared_mutex> lock(rw_mutex);
     size_t old_size = lists[list_no].size;
     resize_locked(list_no, old_size + n_entry);
     update_entries_locked(list_no, old_size, n_entry, ids, code);
@@ -783,7 +812,7 @@ void SpdkInvertedLists::update_entries(
     if (n_entry == 0) {
         return;
     }
-    std::lock_guard<std::mutex> lock(io_mutex);
+    std::unique_lock<std::shared_mutex> lock(rw_mutex);
     update_entries_locked(list_no, offset, n_entry, ids, code);
 }
 
