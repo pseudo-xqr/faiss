@@ -55,10 +55,18 @@ void ensure_spdk_env() {
     opts.name = "faiss_spdk";
     opts.shm_id = -1;        // private DPDK memory; no shared-memory segment
     opts.iova_mode = "va";   // virtual-address IOVA; works without hugepage PA access
-    
+    opts.core_mask = nullptr;
+    opts.lcore_map = "0-15";
+    //printf("--- coremask = %s\n", opts.core_mask);
+    //printf("--- lcore_map = %s\n", opts.lcore_map);
     int rc = spdk_env_init(&opts);
     FAISS_THROW_IF_NOT_FMT(rc == 0, "spdk_env_init failed (rc=%d)", rc);
     g_spdk_env_initialized = true;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    for (int i = 0; i < CPU_SETSIZE; i++) CPU_SET(i, &cpuset);
+    sched_setaffinity(0, sizeof(cpuset), &cpuset);
 }
 
 // ============================================================
@@ -175,7 +183,7 @@ static void finish_ctrlr_init(
             "SpdkInvertedLists: invalid sector size %u",
             sector_size);
 
-    struct spdk_nvme_qpair* qpair =
+    thread_local struct spdk_nvme_qpair* qpair =
             spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, nullptr, 0);
     FAISS_THROW_IF_NOT_MSG(
             qpair != nullptr,
@@ -250,7 +258,8 @@ struct spdk_nvme_qpair* SpdkInvertedLists::get_thread_qpair() const {
     auto it = tl_qpairs.find(ctrlr);
     if (it == tl_qpairs.end() || it->second == nullptr) {
         auto* qp = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, nullptr, 0);
-        FAISS_THROW_IF_NOT_MSG(
+        
+	FAISS_THROW_IF_NOT_MSG(
                 qp != nullptr,
                 "SpdkInvertedLists: failed to alloc per-thread I/O qpair");
         tl_qpairs[ctrlr] = qp;
@@ -663,7 +672,7 @@ size_t SpdkInvertedLists::list_size(size_t list_no) const {
 }
 
 const uint8_t* SpdkInvertedLists::get_codes(size_t list_no) const {
-    std::shared_lock<std::shared_mutex> lock(rw_mutex);
+    //std::shared_lock<std::shared_mutex> lock(rw_mutex);
     const List& l = lists[list_no];
     if (l.size == 0 || l.offset == UINT64_MAX) {
         return nullptr;
@@ -675,7 +684,7 @@ const uint8_t* SpdkInvertedLists::get_codes(size_t list_no) const {
 }
 
 const idx_t* SpdkInvertedLists::get_ids(size_t list_no) const {
-    std::shared_lock<std::shared_mutex> lock(rw_mutex);
+    //std::shared_lock<std::shared_mutex> lock(rw_mutex);
     const List& l = lists[list_no];
     if (l.size == 0 || l.offset == UINT64_MAX) {
         return nullptr;
