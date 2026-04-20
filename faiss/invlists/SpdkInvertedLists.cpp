@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstring>
 #include <unordered_map>
+#include <vector>
 
 #include <spdk/env.h>
 #include <spdk/nvme.h>
@@ -29,15 +30,52 @@ struct IoCompletion {
 
 void io_complete_cb(void* arg, const struct spdk_nvme_cpl* cpl) {
     IoCompletion* comp = static_cast<IoCompletion*>(arg);
-    // comp->error = spdk_nvme_cpl_is_error(cpl);
     comp->done = true;
     if (spdk_nvme_cpl_is_error(cpl)) {
         comp->error = true;
-        // Capture specific error codes
         comp->sct = cpl->status.sct;
         comp->sc = cpl->status.sc;
     }
 }
+
+// ============================================================
+// Per-thread DMA staging buffer — grows on demand, never freed
+// until thread exit.  Eliminates spdk_dma_malloc/free per I/O.
+// ============================================================
+
+struct DmaBuffer {
+    void*  ptr = nullptr;
+    size_t cap = 0;
+
+    // Returns a DMA-capable pointer of at least `needed` bytes aligned to
+    // `alignment`.  Reallocates (doubling) only when the buffer is too small.
+    void* ensure(size_t needed, uint32_t alignment) {
+        if (needed <= cap) {
+            return ptr;
+        }
+        if (ptr) {
+            spdk_dma_free(ptr);
+        }
+        size_t new_cap = cap ? cap : size_t{65536};
+        while (new_cap < needed) {
+            new_cap *= 2;
+        }
+        ptr = spdk_dma_malloc(new_cap, alignment, nullptr);
+        cap = ptr ? new_cap : 0;
+        return ptr;
+    }
+
+    ~DmaBuffer() {
+        if (ptr) {
+            spdk_dma_free(ptr);
+            ptr = nullptr;
+        }
+    }
+};
+
+// One read buffer and one write buffer per thread; lifetime == thread lifetime.
+static thread_local DmaBuffer tl_read_dma;
+static thread_local DmaBuffer tl_write_dma;
 
 // ============================================================
 // SPDK environment — initialised at most once per process
@@ -56,7 +94,7 @@ void ensure_spdk_env() {
     opts.shm_id = -1;        // private DPDK memory; no shared-memory segment
     opts.iova_mode = "va";   // virtual-address IOVA; works without hugepage PA access
     opts.core_mask = nullptr;
-    opts.lcore_map = "0-15";
+    opts.lcore_map = "0-63";
     //printf("--- coremask = %s\n", opts.core_mask);
     //printf("--- lcore_map = %s\n", opts.lcore_map);
     int rc = spdk_env_init(&opts);
@@ -375,195 +413,186 @@ void SpdkInvertedLists::nvme_read(
     struct spdk_nvme_qpair* tqpair = get_thread_qpair();
 
     uint32_t max_io = spdk_nvme_ns_get_max_io_xfer_size(ns);
-    if (max_io == 0 || max_io > 131072u) {
-        max_io = 131072u;
-    }
+    // if (max_io == 0 || max_io > 131072u) {
+    //     max_io = 131072u;
+    // }
     max_io = (max_io / sector_size) * sector_size;
     if (max_io == 0) {
         max_io = sector_size;
     }
 
-    size_t done = 0;
-    while (done < size) {
-        uint64_t cur_offset = byte_offset + done;
-        size_t cur_size = std::min(size - done, static_cast<size_t>(max_io));
+    // Compute the sector-aligned envelope that covers the entire request.
+    uint64_t aligned_start =
+            (byte_offset / sector_size) * (uint64_t)sector_size;
+    size_t head_skip = static_cast<size_t>(byte_offset - aligned_start);
+    size_t aligned_size = align_up(head_skip + size, sector_size);
 
-        uint64_t aligned_offset =
-                (cur_offset / sector_size) * (uint64_t)sector_size;
-        size_t head_skip =
-                static_cast<size_t>(cur_offset - aligned_offset);
-        size_t aligned_size = align_up(head_skip + cur_size, sector_size);
+    // Grow the thread-local DMA staging buffer if needed (no alloc/free per
+    // call; the buffer is returned to the OS only when the thread exits).
+    void* dma_buf = tl_read_dma.ensure(aligned_size, sector_size);
+    FAISS_THROW_IF_NOT_MSG(
+            dma_buf != nullptr,
+            "SpdkInvertedLists: failed to grow thread-local read DMA buffer");
 
-        void* dma_buf = spdk_dma_malloc(aligned_size, sector_size, nullptr);
-        FAISS_THROW_IF_NOT_MSG(
-                dma_buf != nullptr,
-                "SpdkInvertedLists: spdk_dma_malloc failed for read buffer");
+    // Split into max_io chunks and submit ALL of them before waiting.
+    // This keeps the NVMe queue full and hides per-command latency.
+    size_t num_chunks = (aligned_size + max_io - 1) / max_io;
+    std::vector<IoCompletion> comps(num_chunks);
 
-        uint64_t lba = aligned_offset / sector_size;
-        uint32_t lba_count =
-                static_cast<uint32_t>(aligned_size / sector_size);
+    size_t submitted_bytes = 0;
+    for (size_t i = 0; i < num_chunks; ++i) {
+        size_t chunk =
+                std::min(static_cast<size_t>(max_io),
+                         aligned_size - submitted_bytes);
+        uint64_t lba = (aligned_start + submitted_bytes) / sector_size;
+        uint32_t lba_count = static_cast<uint32_t>(chunk / sector_size);
 
-        IoCompletion comp;
         int rc = spdk_nvme_ns_cmd_read(
-                ns, tqpair, dma_buf, lba, lba_count, io_complete_cb, &comp, 0);
+                ns,
+                tqpair,
+                static_cast<char*>(dma_buf) + submitted_bytes,
+                lba,
+                lba_count,
+                io_complete_cb,
+                &comps[i],
+                0);
         FAISS_THROW_IF_NOT_FMT(
                 rc == 0,
-                "SpdkInvertedLists: spdk_nvme_ns_cmd_read submission failed "
-                "(rc=%d)",
-                rc);
-        while (!comp.done) {
-            spdk_nvme_qpair_process_completions(tqpair, 0);
-        }
-        FAISS_THROW_IF_NOT_MSG(
-                !comp.error, "SpdkInvertedLists: NVMe read command failed");
-
-        memcpy(
-                static_cast<char*>(buf) + done,
-                static_cast<const char*>(dma_buf) + head_skip,
-                cur_size);
-        spdk_dma_free(dma_buf);
-        done += cur_size;
+                "SpdkInvertedLists: read cmd submission failed "
+                "(rc=%d chunk=%zu/%zu)",
+                rc,
+                i,
+                num_chunks);
+        submitted_bytes += chunk;
     }
+
+    size_t n_done = 0;
+    while (n_done < num_chunks) {
+        spdk_nvme_qpair_process_completions(tqpair, 0);
+        n_done = 0;
+        for (const auto& c : comps) {
+            n_done += c.done ? 1u : 0u;
+        }
+    }
+
+    for (size_t i = 0; i < num_chunks; ++i) {
+        FAISS_THROW_IF_NOT_FMT(
+                !comps[i].error,
+                "SpdkInvertedLists: NVMe read error on chunk %zu "
+                "(SCT=0x%x SC=0x%x)",
+                i,
+                comps[i].sct,
+                comps[i].sc);
+    }
+
+    memcpy(buf, static_cast<const char*>(dma_buf) + head_skip, size);
 }
 
-// void SpdkInvertedLists::nvme_write(
-//         uint64_t byte_offset,
-//         size_t size,
-//         const void* buf) {
-//     if (size == 0) {
-//         return;
-//     }
-
-//     uint32_t max_io = spdk_nvme_ns_get_max_io_xfer_size(ns);
-//     if (max_io == 0 || max_io > 131072u) {
-//         max_io = 131072u;
-//     }
-//     max_io = (max_io / sector_size) * sector_size;
-//     if (max_io == 0) {
-//         max_io = sector_size;
-//     }
-
-//     size_t done = 0;
-//     while (done < size) {
-//         uint64_t cur_offset = byte_offset + done;
-//         size_t cur_size =
-//                 std::min(size - done, static_cast<size_t>(max_io));
-
-//         uint64_t aligned_offset =
-//                 (cur_offset / sector_size) * (uint64_t)sector_size;
-//         size_t head_skip =
-//                 static_cast<size_t>(cur_offset - aligned_offset);
-//         size_t aligned_size = align_up(head_skip + cur_size, sector_size);
-
-//         void* dma_buf = spdk_dma_malloc(aligned_size, sector_size, nullptr);
-//         FAISS_THROW_IF_NOT_MSG(
-//                 dma_buf != nullptr,
-//                 "SpdkInvertedLists: spdk_dma_malloc failed for write buffer");
-
-//         memset(dma_buf, 0, aligned_size);
-//         memcpy(static_cast<char*>(dma_buf) + head_skip,
-//                static_cast<const char*>(buf) + done,
-//                cur_size);
-
-//         uint64_t lba = aligned_offset / sector_size;
-//         uint32_t lba_count =
-//                 static_cast<uint32_t>(aligned_size / sector_size);
-
-//         IoCompletion comp;
-//         int rc = spdk_nvme_ns_cmd_write(
-//                 ns, qpair, dma_buf, lba, lba_count, io_complete_cb, &comp, 0);
-//         FAISS_THROW_IF_NOT_FMT(
-//                 rc == 0,
-//                 "SpdkInvertedLists: spdk_nvme_ns_cmd_write submission failed "
-//                 "(rc=%d)",
-//                 rc);
-//         while (!comp.done) {
-//             spdk_nvme_qpair_process_completions(qpair, 0);
-//         }
-//         FAISS_THROW_IF_NOT_MSG(
-//                 !comp.error, "SpdkInvertedLists: NVMe write command failed");
-
-//         spdk_dma_free(dma_buf);
-//         done += cur_size;
-//     }
-// }
 void SpdkInvertedLists::nvme_write(
         uint64_t byte_offset,
         size_t size,
         const void* buf) {
-
-    if (size == 0) return;
+    if (size == 0) {
+        return;
+    }
 
     const char* src = static_cast<const char*>(buf);
     uint64_t cur_byte_offset = byte_offset;
     size_t bytes_remaining = size;
 
-    // 1. Determine max I/O size and allocate a reusable DMA buffer 
-    // to avoid high-frequency allocation overhead.
     uint32_t max_io_bytes = spdk_nvme_ns_get_max_io_xfer_size(ns);
-    if (max_io_bytes == 0 || max_io_bytes > 131072u) max_io_bytes = 131072u;
-    
-    // Ensure buffer is at least one sector large
-    size_t dma_buf_size = std::max((size_t)max_io_bytes, (size_t)sector_size);
-    void* dma_buf = spdk_dma_malloc(dma_buf_size, sector_size, nullptr);
-    FAISS_THROW_IF_NOT(dma_buf != nullptr);
+    // if (max_io_bytes == 0 || max_io_bytes > 131072u) {
+    //     max_io_bytes = 131072u;
+    // }
 
-    try {
-        while (bytes_remaining > 0) {
-            uint64_t lba = cur_byte_offset / sector_size;
-            uint64_t offset_in_sector = cur_byte_offset % sector_size;
-            
-            // Calculate how much we can write in this step
-            size_t current_step_size = std::min(bytes_remaining, dma_buf_size - offset_in_sector);
-            
-            // Determine if we need Read-Modify-Write (RMW)
-            // We need RMW if: 
-            // a) The start is not sector-aligned
-            // b) The end is not sector-aligned
-            bool is_aligned_start = (offset_in_sector == 0);
-            bool is_aligned_end = ((offset_in_sector + current_step_size) % sector_size == 0);
+    // Use the thread-local write DMA buffer; grows on demand, never freed per
+    // call.  Writes are serialised under rw_mutex exclusive lock so a single
+    // per-thread buffer is safe.
+    size_t dma_buf_size =
+            std::max(static_cast<size_t>(max_io_bytes),
+                     static_cast<size_t>(sector_size));
+    void* dma_buf = tl_write_dma.ensure(dma_buf_size, sector_size);
+    FAISS_THROW_IF_NOT_MSG(
+            dma_buf != nullptr,
+            "SpdkInvertedLists: failed to grow thread-local write DMA buffer");
 
-            uint32_t lba_count = (offset_in_sector + current_step_size + sector_size - 1) / sector_size;
+    while (bytes_remaining > 0) {
+        uint64_t lba = cur_byte_offset / sector_size;
+        uint64_t offset_in_sector = cur_byte_offset % sector_size;
 
-            if (!is_aligned_start || !is_aligned_end) {
-                // --- READ ---
-                IoCompletion read_comp;
-                int rc = spdk_nvme_ns_cmd_read(
-                    ns, qpair, dma_buf, lba, lba_count, io_complete_cb, &read_comp, 0);
-                
-                if (rc != 0) FAISS_THROW_FMT("Read failed during RMW (rc=%d)", rc);
-                while (!read_comp.done) spdk_nvme_qpair_process_completions(qpair, 0);
-                if (read_comp.error) 
-                    FAISS_THROW_FMT("NVMe read error during RMW, SCT=0x%x, SC=0x%x", read_comp.sct, read_comp.sc);
+        size_t current_step_size =
+                std::min(bytes_remaining, dma_buf_size - offset_in_sector);
+
+        bool is_aligned_start = (offset_in_sector == 0);
+        bool is_aligned_end =
+                ((offset_in_sector + current_step_size) % sector_size == 0);
+
+        uint32_t lba_count = static_cast<uint32_t>(
+                (offset_in_sector + current_step_size + sector_size - 1) /
+                sector_size);
+
+        if (!is_aligned_start || !is_aligned_end) {
+            // Read-Modify-Write: read existing sectors first.
+            IoCompletion read_comp;
+            int rc = spdk_nvme_ns_cmd_read(
+                    ns,
+                    qpair,
+                    dma_buf,
+                    lba,
+                    lba_count,
+                    io_complete_cb,
+                    &read_comp,
+                    0);
+            FAISS_THROW_IF_NOT_FMT(
+                    rc == 0,
+                    "SpdkInvertedLists: RMW read failed (rc=%d)",
+                    rc);
+            while (!read_comp.done) {
+                spdk_nvme_qpair_process_completions(qpair, 0);
             }
-
-            // --- MODIFY ---
-            // Copy user data into the correct position in the DMA buffer
-            memcpy(static_cast<char*>(dma_buf) + offset_in_sector, src, current_step_size);
-
-            // --- WRITE ---
-            IoCompletion write_comp;
-            int rc = spdk_nvme_ns_cmd_write(
-                ns, qpair, dma_buf, lba, lba_count, io_complete_cb, &write_comp, 0);
-
-            if (rc != 0) FAISS_THROW_FMT("Write failed (rc=%d)", rc);
-            while (!write_comp.done) spdk_nvme_qpair_process_completions(qpair, 0);
-            if (write_comp.error) {
-                FAISS_THROW_FMT("NVMe write error: SCT=0x%x, SC=0x%x (LBA: %lu, Count: %u)", 
-                    write_comp.sct, write_comp.sc, lba, lba_count);
-            }
-
-            // Advance pointers
-            cur_byte_offset += current_step_size;
-            src += current_step_size;
-            bytes_remaining -= current_step_size;
+            FAISS_THROW_IF_NOT_FMT(
+                    !read_comp.error,
+                    "SpdkInvertedLists: NVMe read error during RMW "
+                    "(SCT=0x%x SC=0x%x)",
+                    read_comp.sct,
+                    read_comp.sc);
         }
-    } catch (...) {
-        spdk_dma_free(dma_buf);
-        throw;
-    }
 
-    spdk_dma_free(dma_buf);
+        // Patch in the user data.
+        memcpy(static_cast<char*>(dma_buf) + offset_in_sector,
+               src,
+               current_step_size);
+
+        IoCompletion write_comp;
+        int rc = spdk_nvme_ns_cmd_write(
+                ns,
+                qpair,
+                dma_buf,
+                lba,
+                lba_count,
+                io_complete_cb,
+                &write_comp,
+                0);
+        FAISS_THROW_IF_NOT_FMT(
+                rc == 0,
+                "SpdkInvertedLists: write cmd failed (rc=%d)",
+                rc);
+        while (!write_comp.done) {
+            spdk_nvme_qpair_process_completions(qpair, 0);
+        }
+        FAISS_THROW_IF_NOT_FMT(
+                !write_comp.error,
+                "SpdkInvertedLists: NVMe write error "
+                "(SCT=0x%x SC=0x%x LBA=%lu count=%u)",
+                write_comp.sct,
+                write_comp.sc,
+                lba,
+                lba_count);
+
+        cur_byte_offset += current_step_size;
+        src += current_step_size;
+        bytes_remaining -= current_step_size;
+    }
 }
 
 // ============================================================
