@@ -20,14 +20,13 @@ struct spdk_nvme_qpair;
 namespace faiss {
 
 struct SpdkInvertedLists : InvertedLists {
+
     struct List {
         size_t size;     
         size_t capacity; 
         uint64_t offset;
         List();
     };
-
-    /// One entry per inverted list (size == nlist).
     std::vector<List> lists;
     struct Slot {
         uint64_t offset;   ///< byte offset on device
@@ -35,8 +34,6 @@ struct SpdkInvertedLists : InvertedLists {
         Slot(uint64_t offset, uint64_t capacity);
         Slot();
     };
-
-    /// Sorted free-slot list (by offset).
     std::list<Slot> slots;
 
     std::string metadata_path; ///< path to the binary metadata file
@@ -62,22 +59,11 @@ struct SpdkInvertedLists : InvertedLists {
 
     size_t list_size(size_t list_no) const override;
 
-    /**
-     * Reads codes from NVMe and returns a heap-allocated buffer.
-     * MUST be released with release_codes() when done.
-     */
     const uint8_t* get_codes(size_t list_no) const override;
-
-    /**
-     * Reads IDs from NVMe and returns a heap-allocated buffer.
-     * MUST be released with release_ids() when done.
-     */
     const idx_t* get_ids(size_t list_no) const override;
 
     /// Frees the buffer returned by get_codes().
     void release_codes(size_t list_no, const uint8_t* codes) const override;
-
-    /// Frees the buffer returned by get_ids().
     void release_ids(size_t list_no, const idx_t* ids) const override;
 
     size_t add_entries(
@@ -127,6 +113,7 @@ private:
     /// Synchronous NVMe read: copy [byte_offset, byte_offset+size) → buf.
     /// buf does NOT need to be DMA-aligned.
     void nvme_read(uint64_t byte_offset, size_t size, void* buf) const;
+    void nvme_read_zc(uint64_t byte_offset, size_t size, void* dma_buf) const;
 
     /// Synchronous NVMe write: flush buf[0..size) → device at byte_offset.
     /// If the write range is not sector-aligned a read-modify-write is used.
