@@ -97,6 +97,11 @@ void ensure_spdk_env() {
     opts.iova_mode = "va";   // virtual-address IOVA; works without hugepage PA access
     opts.core_mask = nullptr;
     opts.lcore_map = "0-63";
+    // Reserve enough DMA memory for all OMP threads.
+    // With OMP_NUM_THREADS=64 and 3 DMA buffers (read, read_codes, write)
+    // each capped at MAX_DMA_WINDOW (4 MB), peak usage is ~768 MB.
+    // 1024 MB gives a comfortable margin within the available hugepage pool.
+    opts.mem_size = 1024;
     //printf("--- coremask = %s\n", opts.core_mask);
     //printf("--- lcore_map = %s\n", opts.lcore_map);
     int rc = spdk_env_init(&opts);
@@ -406,8 +411,8 @@ align_up(size_t size, uint32_t sector_size) {
 }
 
 void SpdkInvertedLists::nvme_read_zc(
-    uint64_t byte_offset, 
-    size_t size, 
+    uint64_t byte_offset,
+    size_t size,
     void* dma_buf
 ) const {
     if (size == 0) {
@@ -421,43 +426,55 @@ void SpdkInvertedLists::nvme_read_zc(
     uint64_t aligned_start = (byte_offset / sector_size) * (uint64_t)sector_size;
     size_t head_skip = static_cast<size_t>(byte_offset - aligned_start);
     size_t aligned_size = align_up(head_skip + size, sector_size);
-    // Split into max_io chunks and submit all of them before waiting
+
     size_t num_chunks = (aligned_size + max_io - 1) / max_io;
     std::vector<IoCompletion> comps(num_chunks);
-    size_t submitted_bytes = 0; 
-    for (size_t i = 0; i < num_chunks; ++i) {
-        size_t chunk =
-                std::min(static_cast<size_t>(max_io),
-                         aligned_size - submitted_bytes);
-        uint64_t lba = (aligned_start + submitted_bytes) / sector_size;
-        uint32_t lba_count = static_cast<uint32_t>(chunk / sector_size);
 
-        int rc = spdk_nvme_ns_cmd_read(
-                ns,
-                tqpair,
-                static_cast<char*>(dma_buf) + submitted_bytes,
-                lba,
-                lba_count,
-                io_complete_cb,
-                &comps[i],
-                0);
-        FAISS_THROW_IF_NOT_FMT(
-                rc == 0,
-                "SpdkInvertedLists: read cmd submission failed "
-                "(rc=%d chunk=%zu/%zu)",
-                rc,
-                i,
-                num_chunks);
-        submitted_bytes += chunk;
-    }
+    // Sliding window: keep at most MAX_INFLIGHT commands in the qpair at
+    // once to avoid exhausting the per-qpair request pool when many OMP
+    // threads submit simultaneously.
+    static constexpr size_t MAX_INFLIGHT = 8;
+    size_t next_submit = 0;   // index of next chunk to submit
+    size_t submitted_bytes = 0;
     size_t n_done = 0;
+
     while (n_done < num_chunks) {
+        // Submit new chunks until the window is full or all are submitted.
+        while (next_submit < num_chunks &&
+               next_submit - n_done < MAX_INFLIGHT) {
+            size_t chunk = std::min(static_cast<size_t>(max_io),
+                                    aligned_size - submitted_bytes);
+            uint64_t lba = (aligned_start + submitted_bytes) / sector_size;
+            uint32_t lba_count = static_cast<uint32_t>(chunk / sector_size);
+
+            int rc = spdk_nvme_ns_cmd_read(
+                    ns,
+                    tqpair,
+                    static_cast<char*>(dma_buf) + submitted_bytes,
+                    lba,
+                    lba_count,
+                    io_complete_cb,
+                    &comps[next_submit],
+                    0);
+            FAISS_THROW_IF_NOT_FMT(
+                    rc == 0,
+                    "SpdkInvertedLists: read cmd submission failed "
+                    "(rc=%d chunk=%zu/%zu)",
+                    rc,
+                    next_submit,
+                    num_chunks);
+            submitted_bytes += chunk;
+            ++next_submit;
+        }
+
+        // Poll and recount completed chunks.
         spdk_nvme_qpair_process_completions(tqpair, 0);
         n_done = 0;
         for (const auto& c : comps) {
             n_done += c.done ? 1u : 0u;
         }
     }
+
     for (size_t i = 0; i < num_chunks; ++i) {
         FAISS_THROW_IF_NOT_FMT(
                 !comps[i].error,
@@ -492,65 +509,97 @@ void SpdkInvertedLists::nvme_read(
     size_t head_skip = static_cast<size_t>(byte_offset - aligned_start);
     size_t aligned_size = align_up(head_skip + size, sector_size);
 
-    // Grow the thread-local DMA staging buffer if needed (no alloc/free per
-    // call; the buffer is returned to the OS only when the thread exits).
-    void* dma_buf = tl_read_dma.ensure(aligned_size, sector_size);
+    // Cap DMA window so per-thread DMA usage stays bounded.  Must be a
+    // multiple of max_io (itself a multiple of sector_size).  4 MB keeps
+    // 64 OMP threads within the 1024 MB pool reserved at SPDK init.
+    static constexpr size_t MAX_DMA_WINDOW = 4ULL * 1024 * 1024;
+    size_t dma_window = std::min(aligned_size, MAX_DMA_WINDOW);
+    // Round down to max_io boundary so every window is cleanly divisible.
+    dma_window = (dma_window / max_io) * max_io;
+    if (dma_window == 0) {
+        dma_window = max_io;
+    }
+
+    void* dma_buf = tl_read_dma.ensure(dma_window, sector_size);
     FAISS_THROW_IF_NOT_MSG(
             dma_buf != nullptr,
             "SpdkInvertedLists: failed to grow thread-local read DMA buffer");
 
-    // Split into max_io chunks and submit ALL of them before waiting.
-    // This keeps the NVMe queue full and hides per-command latency.
-    size_t num_chunks = (aligned_size + max_io - 1) / max_io;
-    std::vector<IoCompletion> comps(num_chunks);
+    // Iterate over the full aligned range in dma_window-sized passes.
+    size_t nvme_progress = 0; // bytes consumed from [0, aligned_size)
+    size_t dst_written = 0;   // bytes written to buf
 
-    size_t submitted_bytes = 0;
-    for (size_t i = 0; i < num_chunks; ++i) {
-        size_t chunk =
-                std::min(static_cast<size_t>(max_io),
-                         aligned_size - submitted_bytes);
-        uint64_t lba = (aligned_start + submitted_bytes) / sector_size;
-        uint32_t lba_count = static_cast<uint32_t>(chunk / sector_size);
+    while (nvme_progress < aligned_size) {
+        size_t this_pass = std::min(dma_window, aligned_size - nvme_progress);
 
-        int rc = spdk_nvme_ns_cmd_read(
-                ns,
-                tqpair,
-                static_cast<char*>(dma_buf) + submitted_bytes,
-                lba,
-                lba_count,
-                io_complete_cb,
-                &comps[i],
-                0);
-        FAISS_THROW_IF_NOT_FMT(
-                rc == 0,
-                "SpdkInvertedLists: read cmd submission failed "
-                "(rc=%d chunk=%zu/%zu)",
-                rc,
-                i,
-                num_chunks);
-        submitted_bytes += chunk;
-    }
+        // Sliding-window submission: keep at most MAX_INFLIGHT in the qpair.
+        static constexpr size_t MAX_INFLIGHT = 8;
+        size_t num_chunks = (this_pass + max_io - 1) / max_io;
+        std::vector<IoCompletion> comps(num_chunks);
 
-    size_t n_done = 0;
-    while (n_done < num_chunks) {
-        spdk_nvme_qpair_process_completions(tqpair, 0);
-        n_done = 0;
-        for (const auto& c : comps) {
-            n_done += c.done ? 1u : 0u;
+        size_t next_submit = 0;
+        size_t submitted_bytes = 0;
+        size_t n_done = 0;
+
+        while (n_done < num_chunks) {
+            while (next_submit < num_chunks &&
+                   next_submit - n_done < MAX_INFLIGHT) {
+                size_t chunk = std::min(static_cast<size_t>(max_io),
+                                        this_pass - submitted_bytes);
+                uint64_t lba =
+                        (aligned_start + nvme_progress + submitted_bytes) /
+                        sector_size;
+                uint32_t lba_count =
+                        static_cast<uint32_t>(chunk / sector_size);
+
+                int rc = spdk_nvme_ns_cmd_read(
+                        ns,
+                        tqpair,
+                        static_cast<char*>(dma_buf) + submitted_bytes,
+                        lba,
+                        lba_count,
+                        io_complete_cb,
+                        &comps[next_submit],
+                        0);
+                FAISS_THROW_IF_NOT_FMT(
+                        rc == 0,
+                        "SpdkInvertedLists: read cmd submission failed "
+                        "(rc=%d chunk=%zu/%zu)",
+                        rc,
+                        next_submit,
+                        num_chunks);
+                submitted_bytes += chunk;
+                ++next_submit;
+            }
+
+            spdk_nvme_qpair_process_completions(tqpair, 0);
+            n_done = 0;
+            for (const auto& c : comps) {
+                n_done += c.done ? 1u : 0u;
+            }
         }
-    }
 
-    for (size_t i = 0; i < num_chunks; ++i) {
-        FAISS_THROW_IF_NOT_FMT(
-                !comps[i].error,
-                "SpdkInvertedLists: NVMe read error on chunk %zu "
-                "(SCT=0x%x SC=0x%x)",
-                i,
-                comps[i].sct,
-                comps[i].sc);
-    }
+        for (size_t i = 0; i < num_chunks; ++i) {
+            FAISS_THROW_IF_NOT_FMT(
+                    !comps[i].error,
+                    "SpdkInvertedLists: NVMe read error on chunk %zu "
+                    "(SCT=0x%x SC=0x%x)",
+                    i,
+                    comps[i].sct,
+                    comps[i].sc);
+        }
 
-    memcpy(buf, static_cast<const char*>(dma_buf) + head_skip, size);
+        // Copy the user-relevant portion of this pass to buf.
+        // Only the first pass has a head_skip; subsequent passes start at 0.
+        size_t src_offset = (nvme_progress == 0) ? head_skip : 0;
+        size_t copy_bytes = this_pass - src_offset;
+        copy_bytes = std::min(copy_bytes, size - dst_written);
+        memcpy(static_cast<char*>(buf) + dst_written,
+               static_cast<const char*>(dma_buf) + src_offset,
+               copy_bytes);
+        dst_written += copy_bytes;
+        nvme_progress += this_pass;
+    }
     
     // auto end = std::chrono::high_resolution_clock::now();
     // if (buf == nullptr) buf = static_cast<const char*>(dma_buf) + head_skip;
@@ -775,7 +824,7 @@ size_t SpdkInvertedLists::list_size(size_t list_no) const {
 }
 
 const uint8_t* SpdkInvertedLists::get_codes(size_t list_no) const {
-    //! Assume that nvme_read will never perform in concurrent 
+    //! Assume that nvme_read will never perform in concurrent
     //! with write, rm the mutex.
     //std::shared_lock<std::shared_mutex> lock(rw_mutex);
     const List& l = lists[list_no];
@@ -783,26 +832,26 @@ const uint8_t* SpdkInvertedLists::get_codes(size_t list_no) const {
         return nullptr;
     }
     size_t n_bytes = l.size * code_size;
-    // uint8_t* buf = new uint8_t[n_bytes];
-    // nvme_read(l.offset, n_bytes, buf);
-    // return buf;
 
-    // Zero-copy read
+    // Zero-copy fast path: fits within the capped DMA window.
     uint64_t aligned_start = (l.offset / sector_size) * (uint64_t)sector_size;
     size_t head_skip = static_cast<size_t>(l.offset - aligned_start);
     size_t aligned_size = align_up(head_skip + n_bytes, sector_size);
 
-    void* dma_buf = tl_read_dma_codes.ensure(aligned_size, sector_size);
-    FAISS_THROW_IF_NOT_MSG(
-        dma_buf != nullptr,
-        "SpdkInvertedLists: failed to grow thread-local read DMA buffer");
-    nvme_read_zc(l.offset, n_bytes, dma_buf);
-    
-    return static_cast<uint8_t*>(dma_buf) + head_skip;
+    if (aligned_size <= tl_read_dma_codes.cap ||
+        tl_read_dma_codes.ensure(aligned_size, sector_size) != nullptr) {
+        nvme_read_zc(l.offset, n_bytes, tl_read_dma_codes.ptr);
+        return static_cast<uint8_t*>(tl_read_dma_codes.ptr) + head_skip;
+    }
+
+    // Large list: fall back to heap buffer + chunked nvme_read.
+    uint8_t* buf = new uint8_t[n_bytes];
+    nvme_read(l.offset, n_bytes, buf);
+    return buf;
 }
 
 const idx_t* SpdkInvertedLists::get_ids(size_t list_no) const {
-    //! Assume that nvme_read will never perform in concurrent 
+    //! Assume that nvme_read will never perform in concurrent
     //! with write, rm the mutex.
     //std::shared_lock<std::shared_mutex> lock(rw_mutex);
     const List& l = lists[list_no];
@@ -812,32 +861,49 @@ const idx_t* SpdkInvertedLists::get_ids(size_t list_no) const {
     size_t n_bytes = l.size * sizeof(idx_t);
     // IDs are stored after codes in the allocated capacity block.
     uint64_t ids_byte_offset = l.offset + l.capacity * code_size;
-    // idx_t* buf = new idx_t[l.size];
-    // nvme_read(ids_byte_offset, n_bytes, buf);
-    // return buf;
 
-    // Zero-copy read
-    uint64_t aligned_start = (ids_byte_offset / sector_size) * (uint64_t)sector_size;
+    // Zero-copy fast path: fits within the capped DMA window.
+    uint64_t aligned_start =
+            (ids_byte_offset / sector_size) * (uint64_t)sector_size;
     size_t head_skip = static_cast<size_t>(ids_byte_offset - aligned_start);
     size_t aligned_size = align_up(head_skip + n_bytes, sector_size);
-    void* dma_buf = tl_read_dma.ensure(aligned_size, sector_size);
-    FAISS_THROW_IF_NOT_MSG(
-        dma_buf != nullptr,
-        "SpdkInvertedLists: failed to grow thread-local read DMA buffer");
-    nvme_read_zc(ids_byte_offset, n_bytes, dma_buf);
-    return reinterpret_cast<const idx_t*>(static_cast<const char*>(dma_buf) + head_skip);
+
+    if (aligned_size <= tl_read_dma.cap ||
+        tl_read_dma.ensure(aligned_size, sector_size) != nullptr) {
+        nvme_read_zc(ids_byte_offset, n_bytes, tl_read_dma.ptr);
+        return reinterpret_cast<const idx_t*>(
+                static_cast<const char*>(tl_read_dma.ptr) + head_skip);
+    }
+
+    // Large list: fall back to heap buffer + chunked nvme_read.
+    idx_t* buf = new idx_t[l.size];
+    nvme_read(ids_byte_offset, n_bytes, buf);
+    return buf;
 }
 
 void SpdkInvertedLists::release_codes(
         size_t list_no,
         const uint8_t* codes) const {
-    // delete[] codes;
+    // Heap path: pointer is outside the thread-local DMA buffer.
+    if (codes && codes != static_cast<uint8_t*>(tl_read_dma_codes.ptr) &&
+        (tl_read_dma_codes.ptr == nullptr ||
+         codes < static_cast<uint8_t*>(tl_read_dma_codes.ptr) ||
+         codes >= static_cast<uint8_t*>(tl_read_dma_codes.ptr) +
+                         tl_read_dma_codes.cap)) {
+        delete[] codes;
+    }
 }
 
 void SpdkInvertedLists::release_ids(
         size_t list_no,
         const idx_t* ids) const {
-    // delete[] ids;
+    // Heap path: pointer is outside the thread-local DMA buffer.
+    const char* p = reinterpret_cast<const char*>(ids);
+    if (ids && (tl_read_dma.ptr == nullptr ||
+                p < static_cast<char*>(tl_read_dma.ptr) ||
+                p >= static_cast<char*>(tl_read_dma.ptr) + tl_read_dma.cap)) {
+        delete[] ids;
+    }
 }
 
 // ============================================================
